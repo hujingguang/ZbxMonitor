@@ -1,0 +1,417 @@
+#!/opt/common_task/python/bin/python
+# -*- coding: utf-8 -*-
+#该脚本用来监控日志文件并进行关键字告警(不支持大文件>2G)，记录系统每分钟ps,netstat,top信息以及同步系统时间。
+import os
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import time
+import threading
+import commands
+from datetime import datetime
+from datetime import timedelta
+import requests
+from pyinotify import WatchManager, Notifier, ProcessEvent, IN_DELETE, IN_CREATE, IN_MODIFY
+import re
+try:
+    import simplejson
+    json = simplejson
+except ImportError, e:
+    import json
+
+_LOG_INFO = {
+    "log_level": logging.INFO,
+    "log_format": '%(asctime)-15s %(levelname)s %(lineno)s %(message)s',
+    "log_file": '/tmp/common_task.log',
+    "log_max_size": 100000000,
+    "log_backup": 7,
+}
+
+_PID_FILE = '/tmp/common_task.pid'
+_DEBUG = False
+_NTP_SERVER_ADDRESS = 'ntpupdate.tencentyun.com'  # 时间服务器地址
+_NTP_UPDATE_TIME = 300
+_DATA_DIR = '/opt/common_task/data'  # 系统信息存储目录
+_SS_CHECK_INTERVAL = 60
+_PS_CHECK_INTERVAL = 60
+_DATA_RETAIN_DAYS = 7
+_SS_DIR = "tcp_status"
+_PS_DIR = "ps_status"
+_monitor_dict = {
+    "/var/log/messages": [
+        "/var/log/messages",  # 文件绝对路径
+        0,  # 文件扫描指针
+        False,
+        [re.compile("Fatal"),re.compile("I/O error"),re.compile("Failing")]  # 日志告警关键字
+    ],
+    "/var/log/dmesg": [
+        "/var/log/dmesg",
+        0,
+        False,
+        [re.compile("ERROR", re.IGNORECASE),re.compile("failed", re.IGNORECASE),re.compile("Failing", re.IGNORECASE),re.compile("I/O", re.IGNORECASE)]
+    ],
+}
+
+_alert_webhook = ""  # 设置微信告警机器人webhook
+_hostname = commands.getstatusoutput("hostname")[1]
+_first_start = True
+
+
+class EventHandler(ProcessEvent):
+    def __init__(self, logger,path):
+        global _monitor_dict
+        ProcessEvent.__init__(self)
+        self._logger = logger
+        self._path_list = [v[0] for v in _monitor_dict.values()]
+        self._path = path
+        self._logger.info("init Eventhandler")
+
+    def process_IN_DELETE(self, event):
+        global _monitor_dict
+        file_path = event.pathname
+        if file_path in self._path_list and file_path == self._path:
+            _monitor_dict[file_path][2] = True
+            self._logger.info("Delete file:%s" % file_path)
+
+    def process_IN_CREATE(self, event):
+        global _hostname, _monitor_dict
+        file_path = event.pathname.replace('$', '')
+        if file_path in self._path_list and file_path == self._path:
+            _monitor_dict[file_path][1] = 0
+            self._logger.info("Create file: {0}".format(file_path))
+            try:
+                with open(file_path, 'r') as log_file:
+                    while True:
+                        log_file.seek(_monitor_dict[file_path][1])
+                        line = log_file.readline().replace('\n', '')
+                        for m in _monitor_dict[file_path][3]:
+                            if re.search(m, line):
+                                line = line+'\n***From Host: '+_hostname+" FileName: "+file_path
+                                send_message(
+                                    line, self._logger)
+                        if not line:
+                            break
+                        else:
+                            _monitor_dict[file_path][1] = log_file.tell()
+            except Exception as e:
+                self._logger.error(str(e))
+
+    def process_IN_MODIFY(self, event):
+        global _hostname, _monitor_dict
+        file_path = event.pathname.replace('$', '')
+        if file_path in self._path_list and file_path == self._path:
+            if _monitor_dict[file_path][2]:
+                _monitor_dict[file_path][2] = False
+                _monitor_dict[file_path][1] = 0
+            try:
+                self._logger.info("start read {1} on {0}".format(
+                    str(_monitor_dict[file_path][1]), file_path))
+                with open(file_path, 'r') as log_file:
+                    while True:
+                        log_file.seek(_monitor_dict[file_path][1])
+                        line = log_file.readline().replace('\n', '')
+                        for m in _monitor_dict[file_path][3]:
+                            if re.search(m, line):
+                                line = line+'\n***From Host: '+_hostname+" FileName: "+file_path
+                                send_message(
+                                    line, self._logger)
+                        if not line:
+                            break
+                        else:
+                            _monitor_dict[file_path][1] = log_file.tell()
+            except Exception as e:
+                self._logger.error(str(e))
+
+
+def start_monitor(logger, path):
+    while True:
+        if os.path.exists(path):
+            logger.info("File: "+path+" check ok . begain listen")
+            break
+        time.sleep(30)
+        logger.info("File: "+path+" don't exists. reload this file after 30 seconds")
+    wm = WatchManager()
+    mask = IN_DELETE | IN_CREATE | IN_MODIFY
+    notifier = Notifier(wm, EventHandler(logger,path))
+    path=path[:path.rfind('/')]
+    if not path:
+        path='/'
+    wm.add_watch(path, mask, auto_add=True, rec=True)
+    while True:
+        try:
+            notifier.process_events()
+            if notifier.check_events():
+                notifier.read_events()
+        except Exception as e:
+            logger.error(str(e))
+
+
+def monitor_file(logger):
+    global _first_run, _monitor_dict
+    path_list = [v[0] for k, v in _monitor_dict.iteritems()]
+    logger.info(str(path_list))
+    logger.info("start log monitor thread  monitor file: "+str(path_list))
+    if _first_start:
+        _first_run = False
+        msg = 'start listen and postion \n'
+        for file_path in path_list:
+            if os.path.exists(file_path):
+                total_chars_count = commands.getstatusoutput(
+                    "wc -m "+file_path+"|awk '{print $1}'")[1]
+                pointer = int(total_chars_count) if int(
+                    total_chars_count) > 0 else 0
+                _monitor_dict[file_path][1] = pointer
+                msg = msg+" " + \
+                    file_path+"  pointer: "+str(pointer)+'\n'
+        logger.info(msg)
+    monitor_threads = []
+    for path in path_list:
+        monitor_threads.append(threading.Thread(
+            target=start_monitor, args=(logger, path)))
+
+    def threads_join(threads):
+        for thread in threads:
+            while True:
+                if thread.isAlive():
+                    time.sleep(3)
+                else:
+                    break
+
+    for thread in monitor_threads:
+        thread.setDaemon(True)
+        thread.start()
+    threads_join(monitor_threads)
+
+
+def send_message(mess, logger, url=None):
+    global _alert_webhook
+    if url:
+        web_url = url
+    else:
+        web_url = _alert_webhook
+    mess = mess
+    data = {"msgtype": "text", "text": {"content": mess}}
+    headers = {"Content-Type": "application/json"}
+    try:
+        requests.post(web_url, headers=headers, data=json.dumps(data))
+    except Exception as e:
+        logger.info(str(e))
+
+
+def sync_server_datetime(logger):
+    global _NTP_SERVER_ADDRESS, _NTP_UPDATE_TIME
+    if not os.path.exists('/usr/sbin/ntpdate'):
+        cmd = False
+        logger.info('/usr/sbin/ntpdate commands do not exists . skip this task')
+    else:
+        cmd = '/usr/sbin/ntpdate  -u  {0}'.format(_NTP_SERVER_ADDRESS)
+    if cmd:
+        while True:
+            res, output = commands.getstatusoutput(cmd)
+            logger.info(output)
+            time.sleep(_NTP_UPDATE_TIME)
+
+
+def clean_old_data(logger, type_dir):
+    global _DATA_RETAIN_DAYS, _DATA_DIR
+    remove_day = datetime.strftime(
+        datetime.now()+timedelta(days=-_DATA_RETAIN_DAYS), "%Y-%m-%d")
+    remove_dir = os.path.join(os.path.join(_DATA_DIR, type_dir), remove_day)
+    if os.path.exists(remove_dir) and remove_dir not in ["/", "/.", "./.", "/boot", "/etc"]:
+        cmd = "rm -rf {0}".format(remove_dir)
+        os.system(cmd)
+        logger.info("clean data dir: {0}".format(remove_dir))
+
+
+def tcp_status_by_ss(logger):
+    global _DATA_DIR, _SS_CHECK_INTERVAL, _SS_DIR
+    ss_dir = os.path.join(_DATA_DIR, _SS_DIR)
+    while True:
+        output_dir = os.path.join(
+            ss_dir, datetime.strftime(datetime.now(), '%Y-%m-%d'))
+        if not os.path.exists(output_dir):
+            os.system('mkdir -p {0}'.format(output_dir))
+        output_file = os.path.join(
+            output_dir, datetime.strftime(datetime.now(), '%H%M%S'))
+        cmd = '/usr/sbin/ss -ant4 &> {0}'.format(output_file)
+        result = os.system(cmd)
+        logger.info(
+            "tcp_status_by_ss method run result: {0}".format(str(result)))
+        clean_old_data(logger, _SS_DIR)
+        time.sleep(_SS_CHECK_INTERVAL)
+
+
+def process_status_by_ps(logger):
+    global _DATA_DIR, _PS_CHECK_INTERVAL, _PS_DIR
+    ps_dir = os.path.join(_DATA_DIR, _PS_DIR)
+    while True:
+        output_dir = os.path.join(
+            ps_dir, datetime.strftime(datetime.now(), '%Y-%m-%d'))
+        if not os.path.exists(output_dir):
+            os.system('mkdir -p {0}'.format(output_dir))
+        output_file = os.path.join(
+            output_dir, datetime.strftime(datetime.now(), '%H%M%S'))
+        cmd = '/bin/top -b -c -n 1 &> {0} && /usr/bin/ps aux &>> {1}'.format(
+            output_file, output_file)
+        result = os.system(cmd)
+        logger.info(
+            "ps_status_by_ss method run result: {0}".format(str(result)))
+        clean_old_data(logger, _PS_DIR)
+        time.sleep(_PS_CHECK_INTERVAL)
+
+
+# callbacks 填入编写的监控函数名
+CALL_BACKS = [sync_server_datetime, tcp_status_by_ss,
+              process_status_by_ps, monitor_file]
+# 检测时间间隔
+CHECK_INTERNAL = 60
+
+
+class Daemon(object):
+    def __init__(self):
+        self._pid_file = _PID_FILE
+        self._std_in_file = '/dev/null'
+        self._std_out_file = '/dev/null'
+        self._std_err_file = _LOG_INFO.get('log_file', '/var/log/agent.log')
+        self.logger_ok = False
+        self.logger = None
+
+    def set_logger(self):
+        global _LOG_INFO, _DEBUG
+        logging.basicConfig(level=logging.DEBUG, filename='/dev/null')
+        Logger = logging.getLogger('Agent')
+        log_level = _LOG_INFO.get('log_level', logging.INFO)
+        log_format = logging.Formatter(_LOG_INFO.get('log_format', ''))
+        log_file = _LOG_INFO.get('log_file', '/tmp/agent.log')
+        if _DEBUG:
+            handler = logging.StreamHandler()
+        else:
+            log_max_size = _LOG_INFO.get('log_max_size', 100000)
+            log_backup = _LOG_INFO.get('log_backup', 7)
+            log_folder = os.path.dirname(_LOG_INFO.get('log_file'))
+            if os.path.exists(log_folder):
+                os.system('mkdir -p {0}'.format(log_folder))
+            handler = RotatingFileHandler(
+                log_file, 'a', log_max_size, log_backup)
+        handler.setLevel(log_level)
+        handler.setFormatter(log_format)
+        Logger.addHandler(handler)
+        if not self.logger:
+            self.logger = logging.getLogger('Agent')
+
+    def init_logger(self):
+        if not self.logger_ok:
+            self.logger_ok = True
+            self.set_logger()
+
+    def daemonize(self):
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+        except OSError, e:
+            self.logger.error(str(e))
+        os.setsid()
+        os.umask(0)
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+        except OSError, e:
+            self.logger.error(str(e))
+        for f in sys.stdout, sys.stderr:
+            f.flush()
+        si = file(self._std_in_file, 'r')
+        so = file(self._std_out_file, 'a+')
+        se = file(self._std_err_file, 'a+', 0)
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+        import atexit
+        atexit.register(self.del_pidfile)
+        pid = str(os.getpid())
+        self.logger.info(str(pid))
+        if not os.path.exists(os.path.dirname(self._pid_file)):
+            os.makedirs(os.path.dirname(self._pid_file))
+        with open(self._pid_file, 'w') as f:
+            f.write(pid)
+
+    def start(self):
+        if not _DEBUG:
+            if os.path.exists(self._pid_file):
+                self.logger.info('agent is running ?')
+                sys.exit(1)
+            self.daemonize()
+            self.logger.info('start agent success')
+        else:
+            self.logger.info('start agent in debug mode')
+        worker = Worker(CALL_BACKS)
+        worker.start_loop()
+
+    def stop(self):
+        if not os.path.exists(self._pid_file):
+            self.logger.error('the pid file is not exists! stop fail')
+            sys.exit(1)
+        pid = None
+        with open(self._pid_file) as f:
+            pid = int(f.readline())
+        if pid:
+            os.system('kill -9 {0}'.format(str(pid)))
+            self.logger.info('Stop main thread success')
+        try:
+            os.remove(self._pid_file)
+        except Exception as e:
+            self.logger.info(str(e))
+
+    def del_pidfile(self):
+        os.remove(self._pid_file)
+
+    def restart(self):
+        self.stop()
+        time.sleep(1)
+        self.start()
+
+    def parse_input(self, opt):
+        if opt == 'start':
+            self.start()
+        elif opt == 'stop':
+            self.stop()
+        elif opt == 'restart':
+            self.restart()
+        else:
+            self.logger.error(
+                'bad params ,exsample: ./common_task  start|stop|restart')
+            sys.exit(1)
+
+
+class Worker(object):
+    def __init__(self, callbacks=None, internal=CHECK_INTERNAL):
+        self._callbacks = callbacks
+        self.logger = logging.getLogger('Agent')
+        self._internal = internal
+
+    def start_loop(self):
+        # while True:
+        callbacks = self._callbacks
+        threads = []
+        if callbacks:
+            for callback in callbacks:
+                threads.append(threading.Thread(
+                    target=callback, args=(self.logger,)))
+            for t in threads:
+                try:
+                    t.start()
+                except Exception as e:
+                    self.logger(str(e))
+                    threads.remove(t)
+            for t in threads:
+                t.join(timeout=600)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 2:
+        daemon = Daemon()
+        daemon.init_logger()
+        daemon.parse_input(sys.argv[1])
+    else:
+        print 'bad params'
