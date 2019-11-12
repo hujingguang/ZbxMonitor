@@ -1,0 +1,32 @@
+---
+- hosts: netdata_hosts
+  remote_user: root
+  gather_facts: False
+  tasks:
+  - name: check netdata is installed ?
+    shell: test -e /opt/netdata/etc/netdata/netdata.conf &>/dev/null
+    register: result
+    ignore_errors: True
+
+  - name: install dependence packs
+    shell: yum install  autoconf automake curl gcc git libmnl-devel libuuid-devel openssl-devel libuv-devel lz4-devel Judy-devel make nc pkgconfig python zlib-devel -y &>/dev/null
+    async: 600
+    poll: 30
+
+  - name: upload install packages
+    copy:
+      src: ./files/netdata-v1.18.1.tar.gz
+      dest: /tmp/
+    when: result is failed
+
+  - name: install netdata
+    shell: cd /tmp && tar -zxf netdata-v1.18.1.tar.gz && cd netdata-v1.18.1 && ./netdata-installer.sh --stable-channel --install /opt --dont-start-it &>/dev/null
+    async: 600
+    poll: 30
+    when: result is failed
+
+  - name: start netdata
+    systemd:
+      name: netdata
+      state: started
+      enabled: yes
