@@ -1,5 +1,5 @@
 ---
-- hosts: netdata_hosts
+- hosts: k8s
   remote_user: root
   gather_facts: False
   tasks:
