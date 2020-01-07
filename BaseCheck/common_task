@@ -34,9 +34,11 @@ _NTP_UPDATE_TIME = 300
 _DATA_DIR = '/opt/common_task/data'  # 系统信息存储目录
 _SS_CHECK_INTERVAL = 60
 _PS_CHECK_INTERVAL = 60
+_IFTOP_CHECK_INTERVAL = 60
 _DATA_RETAIN_DAYS = 7
 _SS_DIR = "tcp_status"
 _PS_DIR = "ps_status"
+_IFTOP_DIR = "iftop_status"
 _monitor_dict = {
     "/var/log/messages": [
         "/var/log/messages",  # 文件绝对路径
@@ -56,6 +58,7 @@ _alert_webhook = ""  # 设置微信告警机器人webhook
 _hostname = commands.getstatusoutput("hostname")[1]
 _first_start = True
 
+os.system('yum install iftop -y &>/dev/null')
 
 class EventHandler(ProcessEvent):
     def __init__(self, logger,path):
@@ -239,8 +242,25 @@ def tcp_status_by_ss(logger):
             "tcp_status_by_ss method run result: {0}".format(str(result)))
         clean_old_data(logger, _SS_DIR)
         time.sleep(_SS_CHECK_INTERVAL)
+        
+        
+def network_status_by_iftop(logger):
+    global _DATA_DIR, _IFTOP_CHECK_INTERVAL, _IFTOP_DIR
+    iftop_dir = os.path.join(_DATA_DIR, _IFTOP_DIR)
+    while True:
+        output_dir = os.path.join(iftop_dir, datetime.strftime(datetime.now(), '%Y-%m-%d'))
+        if not os.path.exists(output_dir):
+            os.system('mkdir -p {0}'.format(output_dir))
+        output_file = os.path.join(output_dir, datetime.strftime(datetime.now(), '%H%M%S'))
+        cmd = 'iftop  -u bytes -Nn -P -t -s 30 -L 20 &> {0}'.format(output_file)
+        result = os.system(cmd)
+        logger.info("network_status_by_iftop method run result: {0}".format(str(result)))
+        clean_old_data(logger, _IFTOP_DIR)
+        time.sleep(_IFTOP_CHECK_INTERVAL)
 
-
+        
+        
+        
 def process_status_by_ps(logger):
     global _DATA_DIR, _PS_CHECK_INTERVAL, _PS_DIR
     ps_dir = os.path.join(_DATA_DIR, _PS_DIR)
@@ -262,7 +282,7 @@ def process_status_by_ps(logger):
 
 # callbacks 填入编写的监控函数名
 CALL_BACKS = [sync_server_datetime, tcp_status_by_ss,
-              process_status_by_ps, monitor_file]
+              process_status_by_ps, monitor_file,network_status_by_iftop]
 # 检测时间间隔
 CHECK_INTERNAL = 60
 
