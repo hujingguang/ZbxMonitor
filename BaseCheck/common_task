@@ -252,7 +252,7 @@ def network_status_by_iftop(logger):
         if not os.path.exists(output_dir):
             os.system('mkdir -p {0}'.format(output_dir))
         output_file = os.path.join(output_dir, datetime.strftime(datetime.now(), '%H%M%S'))
-        cmd = 'iftop  -u bytes -Nn -P -t -s 30 -L 20 &> {0}'.format(output_file)
+        cmd = '/sbin/iftop  -u bytes -Nn -P -t -s 30 -L 150 -o source &> {0}'.format(output_file)
         result = os.system(cmd)
         logger.info("network_status_by_iftop method run result: {0}".format(str(result)))
         clean_old_data(logger, _IFTOP_DIR)
